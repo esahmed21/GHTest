@@ -1,0 +1,714 @@
+Dddddddd
+import Experimentation
+import GitHubAPI
+import GitHubUI
+import GraphQL
+import Lists
+import Palette
+import UIKit
+
+final class PullRequestFilesViewController: UIViewController,
+    ErrorViewDelegate,
+    InfiniteScrollControllerDataSource,
+    AdapterDataSource,
+    PullRequestFilesDataControllerDelegate,
+    NewIssueViewControllerDelegate,
+    MarkdownCodeCellDelegate,
+    AutomaticLinkDelegate,
+PullRequestPatchFileSectionDelegate {
+
+    typealias ClientType = PullRequestFilesDataControllerClient
+        & PullRequestReviewModelControllerClient
+        & IssueCommentReactingClient
+        & CommentBodyClient
+        & EditIssueCommentViewControllerClient
+        & EditPullRequestCommentViewControllerClient
+        & MarkdownTextBarViewController.ClientType
+        & UserAutocompleteClient
+
+    private let issue: Issue
+    private let client: ClientType
+    private let issueViewModelClient: IssueViewModelControllerClient
+    private lazy var tableView: UITableView = {
+        let view = UITableView()
+        view.separatorStyle = .none
+        view.backgroundColor = Asset.backgroundPrimary.color
+        if isMultilineCommentsEnabled {
+            view.allowsSelectionDuringEditing = true
+        }
+        return view
+    }()
+    private lazy var infiniteScroll = InfiniteScrollController(tableView: self.tableView)
+    private lazy var resizer = ListsTableResizer(adapter: self.infiniteScroll.adapter)
+    private let codeSettings: CodeSettings.Settings
+    private let modelController: PullRequestFilesDataController
+    private lazy var shareBarButton: UIBarButtonItem = {
+        let item = UIBarButtonItem(image: Asset.share24.image, target: self, action: #selector(onShare))
+        item.accessibilityLabel = L10n.voiceoverButtonFilesShareLabel
+        item.isEnabled = false
+        return item
+    }()
+
+    private var collapsedFileIds = Set<AnyHashable>()
+
+    private let graphQLID: String
+    private let options: ReviewOptions
+    private let onReview: (() -> Void)?
+
+    private var isMultilineCommentsEnabled: Bool {
+        // current `.multilineComments` UI requires `.barOfActions` UI
+        FeatureFlag.barOfActions.isEnabled && FeatureFlag.multilineComments.isEnabled
+    }
+
+    private var lineSelection: MultilineCommentSelection? {
+        didSet {
+            if lineSelection != nil {
+                tableView.setEditing(true, animated: trueUnlessReduceMotionEnabled)
+            } else {
+                tableView.setEditing(false, animated: trueUnlessReduceMotionEnabled)
+            }
+            updateBoA()
+            infiniteScroll.adapter.update()
+        }
+    }
+
+    init(
+        issue: Issue,
+        client: ClientType,
+        issueViewModelClient: IssueViewModelControllerClient,
+        graphQLID: String,
+        options: ReviewOptions,
+        codeSettings: CodeSettings.Settings,
+        onReview: (() -> Void)?
+    ) {
+        self.issue = issue
+        self.client = client
+        self.issueViewModelClient = issueViewModelClient
+        self.graphQLID = graphQLID
+        self.options = options
+        self.onReview = onReview
+        self.codeSettings = codeSettings
+        self.modelController = PullRequestFilesDataController(client: client, issue: issue)
+        super.init(nibName: nil, bundle: nil)
+        self.modelController.delegate = self
+        title = L10n.labelFiles
+        hidesBottomBarWhenPushed = true
+        navigationItem.rightBarButtonItem = shareBarButton
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        infiniteScroll.dataSource = self
+        install(tableView: tableView, adapter: infiniteScroll.adapter)
+        tableView.refreshControl = UIRefreshControl.makeImproved(target: self, action: #selector(refresh))
+
+        if isMultilineCommentsEnabled {
+            let gesture = UILongPressGestureRecognizer(target: self, action: #selector(toggleEditing))
+            tableView.addGestureRecognizer(gesture)
+        }
+
+        set(state: .loading(shouldDelay: true), mainView: tableView)
+        fetch()
+
+        // Hack: we need the following lines to prevent the table view from jumping when
+        // collapsing/opening the section: https://developer.apple.com/forums/thread/86703
+        tableView.estimatedRowHeight = 0
+        tableView.estimatedSectionHeaderHeight = 0
+        tableView.estimatedSectionFooterHeight = 0
+
+        // do not setup/display the review card if viewer cannot leave a review
+        if !options.contains(.disabled) {
+            var inset = tableView.contentInset
+            if isBoAEnabled {
+                addChild(boaViewController)
+                view.addSubview(boaViewController.view)
+                boaViewController.view.translatesAutoresizingMaskIntoConstraints = false
+                boaViewController.view.snp.makeConstraints { make in
+                    make.trailing.equalTo(view.safeAreaLayoutGuide.snp.trailingMargin)
+                        .inset(boaTrailingMargin(traitCollection: traitCollection))
+                    make.bottom.equalTo(view.safeAreaLayoutGuide.snp.bottomMargin).inset(grid(4))
+                }
+                boaViewController.didMove(toParent: self)
+                inset.bottom += grid(11)
+            } else {
+                reviewCardController.add(to: self)
+                reviewCardController.set(state: DisplayState(
+                    type: .compact,
+                    displayAsPresentation: true
+                ), animated: false)
+
+                // inset scroll indicators to top of card, but add more padding to table view
+                inset.bottom += cardPeekHeight
+                tableView.scrollIndicatorInsets = inset
+            }
+
+            inset.bottom += grid(8)
+            tableView.contentInset = inset
+        }
+    }
+
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        if isBoAEnabled {
+            boaViewController.view.snp.updateConstraints { update in
+                update.trailing.equalTo(view.safeAreaLayoutGuide.snp.trailingMargin)
+                    .inset(boaTrailingMargin(traitCollection: traitCollection))
+            }
+        }
+    }
+
+    // MARK: - Bar of Actions
+
+    private var isBoAEnabled: Bool {
+        FeatureFlag.barOfActions.isEnabled
+    }
+
+    private lazy var reviewChangesAction = BoAAction.reviewChangesAction {
+        self.present(self.reviewViewController, animated: true)
+    }
+
+    private func commentAction(for selection: MultilineCommentSelection) -> BoAAction {
+        BoAAction(id: "comment", image: Asset.comment16.image, title: selection.buttonTitle!) {
+            guard let selection = self.lineSelection, !selection.selectedRange.isEmpty else { return }
+            let lines = selection.file.patch.patchLines.filter { selection.selectedRange.contains($0.position) }
+            self.showCommentModal(lines, selection.file)
+        }
+    }
+
+    private lazy var cancelEditingAction = BoAAction(id: "cancel", image: Asset.xCircleFilled16.image, title: L10n.labelCancel) {
+        self.lineSelection = nil
+    }
+
+    private lazy var boaViewController = BoAViewController(actions: [reviewChangesAction])
+
+    private func boaTrailingMargin(traitCollection: UITraitCollection) -> CGFloat {
+        return traitCollection.horizontalSizeClass == .compact ? grid(4) : grid(8)
+    }
+
+    // MARK: - Card and Review Controllers
+
+    private lazy var reviewViewController: NewPullRequestReviewViewController = {
+        let reviewViewController = NewPullRequestReviewViewController(
+            markdownClient: self.client,
+            issueViewModelClient: self.issueViewModelClient,
+            pullRequestId: self.graphQLID,
+            options: self.options,
+            onSubmit: { [weak self] in
+                self?.dismissReviewUI()
+                self?.onReview?()
+                self?.modelController.removePendingReview()
+                self?.modelController.fetchHead()
+            },
+            onCancel: { [weak self] in
+                self?.dismissReviewUI()
+            })
+        reviewViewController.preferredContentSize =
+            CGSize(width: grid(135), height: grid(155))
+
+        return reviewViewController
+    }()
+
+    private let cardPeekHeight = grid(22)
+    private lazy var reviewCardController: CardController = {
+        let controller = CardController(
+            contentViewController: reviewViewController,
+            options: Card.Options(
+                peekHeight: cardPeekHeight,
+                compactTopHeight: grid(4),
+                voiceoverCompactButtonLabel: L10n.voiceoverButtonReviewCardLabel
+            )
+        )
+        return controller
+    }()
+
+    private func dismissReviewUI() {
+        if isBoAEnabled {
+            dismiss(animated: trueUnlessReduceMotionEnabled)
+        } else {
+            reviewCardController.set(
+                state: DisplayState(
+                    type: .compact,
+                    displayAsPresentation: true
+                ),
+                animated: trueUnlessReduceMotionEnabled
+            )
+        }
+    }
+
+    // MARK: - Fetch
+
+    private func fetch(completion: (() -> Void)? = nil) {
+        set(state: .loading(shouldDelay: true), mainView: tableView)
+        modelController.fetchHead(completion: completion)
+    }
+
+    @objc private func refresh() {
+        modelController.fetchHead()
+    }
+
+    private func fetchBody(for commentId: String, block: @escaping (String) -> Void) {
+        client.fetchCommentBody(graphQLID: commentId) { [weak self] result in
+            switch result {
+            case let .success(body):
+                block(body)
+            case let .failure(error):
+                self?.toast(error: error)
+            }
+        }
+    }
+
+    // MARK: - Share
+
+    private func updateShareButton() {
+        shareBarButton.isEnabled = modelController.currentViewModel?.url != nil
+    }
+
+    @objc private func onShare(_ sender: Any) {
+        guard let url = self.modelController.currentViewModel?.url,
+            let source = UIActivityViewController.Source(sender) else { return }
+        let activity = UIActivityViewController.share(url: url, from: source)
+        present(activity, animated: trueUnlessReduceMotionEnabled)
+    }
+
+    // MARK: - ErrorViewDelegate
+
+    func didTapRetry(view: ErrorView) {
+        fetch()
+    }
+
+    // MARK: - InfiniteScrollControllerDataSource
+
+    func canLoadMore(for controller: InfiniteScrollController, finishLoadMore: @escaping () -> Void) -> Bool {
+        guard modelController.canLoadMore else { return false }
+        modelController.fetchNextPage(completion: finishLoadMore)
+        return true
+    }
+
+    // MARK: - AdapterDataSource
+
+    private func selectedRange(for file: PullRequestFileViewModel) -> ClosedRange<MultilineCommentSelection.Position>? {
+        if file.id == self.lineSelection?.file.id {
+            return self.lineSelection?.selectedRange
+        }
+        return nil
+    }
+
+    var sections: [SectionType] {
+        modelController.files.map {
+            PullRequestPatchFileSection(
+                model: $0,
+                isCollapsed: collapsedFileIds.contains($0.id),
+                resizer: resizer,
+                referrer: self,
+                delegate: self,
+                codeSettings: codeSettings,
+                selectedRange: self.selectedRange(for: $0)
+            )
+        }
+    }
+
+    // MARK: - PullRequestPatchFileSectionDelegate
+
+    private func showCommentModal(_ lines: [PatchLine], _ model: PullRequestFileViewModel) {
+        let action: EditPullRequestCommentViewController.Action
+        guard let startLine = lines.first else {
+            fatalError("Attempted to comment without lines to comment on!")
+        }
+
+        if lines.count > 1, let endLine = lines.last {
+            if let pendingReview = modelController.currentViewModel?.pendingReview {
+                action = .pullRequestMultilineComment(reviewId: pendingReview.id, path: startLine.path, startLine: startLine, endLine: endLine)
+            } else {
+                action = .pullRequestMultilineCommentWithNewReview(pullRequestId: graphQLID, path: startLine.path, startLine: startLine, endLine: endLine)
+            }
+        } else {
+            if let pendingReview = modelController.currentViewModel?.pendingReview {
+                action = .pullRequestReviewComment(reviewId: pendingReview.id, path: startLine.path, line: startLine)
+            } else {
+                action = .pullRequestCommentWithNewReview(pullRequestId: graphQLID, path: startLine.path, line: startLine)
+            }
+        }
+
+        let viewController = EditPullRequestCommentViewController(
+            client: self.client,
+            action: action,
+            lines: lines,
+            codeSettings: codeSettings,
+            onCommentCreated: { [weak self] (_, item) in
+                guard let self = self, let threadId = item.threadId else { return }
+                self.lineSelection = nil
+
+                // TODO: fix in follow up when refactoring all API responses for this.
+                let lineRange: PatchFileThread.LineRange?
+                if lines.count > 1, let startLine = lines.first, let endLine = lines.last {
+                    lineRange = PatchFileThread.LineRange(
+                        start: startLine.diffSide == .left
+                            ? startLine.left ?? 1
+                            : startLine.right ?? 1,
+                        startLineType: startLine.lineRangeType,
+                        end: endLine.diffSide == .left
+                            ? endLine.left ?? 1
+                            : endLine.right ?? 1,
+                        endLineType: endLine.lineRangeType
+                    )
+                } else {
+                    lineRange = nil
+                }
+                let thread = PatchFileThread(
+                    rootComment: item.comment,
+                    threadId: threadId,
+                    state: item.state,
+                    path: lines.last?.path ?? "",
+                    position: lines.last?.position ?? 1,
+                    lineRange: lineRange
+                )
+                _ = self.modelController.add(thread: thread, to: model, pendingReview: item.pendingReview)
+                self.dismiss(animated: trueUnlessReduceMotionEnabled, completion: nil)
+            },
+            onCancel: { [weak self] _ in
+                self?.dismiss(animated: trueUnlessReduceMotionEnabled, completion: nil)
+            }
+        )
+
+        present(viewController, animated: trueUnlessReduceMotionEnabled, completion: nil)
+    }
+
+    func didSelectLine(section: PullRequestPatchFileSection, line: PatchLine) {
+        guard line.type != .hunk else { return }
+
+        if var lineSelection = self.lineSelection {
+            guard section.model == lineSelection.file else {
+                self.lineSelection = MultilineCommentSelection(file: section.model, initialSelection: line)
+                return
+            }
+
+            let willDeselect = lineSelection.selectedRange.contains(line.position)
+            if willDeselect {
+                do {
+                    try lineSelection.deselect(line: line)
+                    self.lineSelection = lineSelection
+                } catch MultilineCommentSelection.Error.deselectWillCauseEmptySelection {
+                    self.lineSelection = nil
+                } catch {
+                    assertionFailure("Unknown error from deselection: \(error)")
+                    self.lineSelection = nil
+                }
+            } else {
+                lineSelection.select(line: line)
+                self.lineSelection = lineSelection
+            }
+        } else {
+            showCommentModal([line], section.model)
+        }
+    }
+
+    func didReact(section: PullRequestPatchFileSection, updatedComment: PatchFileThread.Comment, in thread: PatchFileThread, isAdd: Bool, reaction: ReactionContent) {
+        let rollback = modelController.update(comment: updatedComment, in: thread, for: section.model)
+        client.updateReaction(commentID: updatedComment.comment.id, content: reaction, isAdd: isAdd) { [weak self] result in
+            if case .failure(let error) = result {
+                rollback(error)
+                self?.toast(error: error)
+            }
+        }
+    }
+
+    func didToggleMinimizedComment(section: PullRequestPatchFileSection, updatedComment: PatchFileThread.Comment, in thread: PatchFileThread) {
+        _ = modelController.update(comment: updatedComment, in: thread, for: section.model)
+    }
+
+    func didSelectEditComment(section: PullRequestPatchFileSection, comment: PatchFileThread.Comment, in thread: PatchFileThread) {
+        let commentId = comment.graphQLID
+        // TODO: make this a EditPullRequestCommentViewController too?
+        let action = EditIssueCommentViewController.Action.editPullRequestReviewComment(commentID: commentId)
+        let file = section.model
+
+        fetchBody(for: commentId) { [weak self] body in
+            guard let self = self else { return }
+            let viewController = EditIssueCommentViewController(
+                client: self.client,
+                action: action,
+                initialText: body,
+                onCommentCreated: { [weak self] (_, item) in
+                    guard let self = self else { return }
+
+                    var updatedComment = comment
+                    updatedComment.comment = item
+                    _ = self.modelController.update(comment: updatedComment, in: thread, for: file)
+
+                    self.dismiss(animated: trueUnlessReduceMotionEnabled, completion: nil)
+                },
+                onCancel: { [weak self] _ in
+                    self?.dismiss(animated: trueUnlessReduceMotionEnabled, completion: nil)
+                })
+            self.present(viewController, animated: trueUnlessReduceMotionEnabled, completion: nil)
+        }
+    }
+
+    func didSelectDeleteComment(section: PullRequestPatchFileSection, comment: PatchFileThread.Comment, in thread: PatchFileThread) {
+        let file = section.model
+        let rollback = modelController.delete(comment: comment, in: thread, for: file)
+        client.deletePullRequestReviewComment(graphQLID: comment.graphQLID) { result in
+            if case .failure(let error) = result {
+                rollback(error)
+            }
+        }
+    }
+
+    func didSelectReply(section: PullRequestPatchFileSection, in thread: PatchFileThread) {
+        let file = section.model
+        let editController = EditPullRequestCommentViewController(
+            client: client,
+            action: .pullRequestReviewReply(threadID: thread.graphQLID, pendingReviewId: modelController.currentViewModel?.pendingReview?.id),
+            codeSettings: codeSettings,
+            onCommentCreated: { [weak self] (vc, item) in
+                vc.dismiss(animated: trueUnlessReduceMotionEnabled)
+                guard let self = self else { return }
+                let comment = PatchFileThread.Comment(issueComment: item.comment, state: item.state)
+                _ = self.modelController.add(comment: comment, to: thread, for: file, pendingReview: item.pendingReview)
+            }, onCancel: { vc in
+                vc.dismiss(animated: trueUnlessReduceMotionEnabled)
+            }
+        )
+        editController.modalPresentationStyle = .formSheet
+        present(editController, animated: trueUnlessReduceMotionEnabled)
+    }
+
+    func didSelectToggleHidden(section: PullRequestPatchFileSection, in thread: PatchFileThread) {
+        _ = modelController.toggleHidden(thread: thread, for: section.model)
+    }
+
+    func didSelectLoadMore(section: PullRequestPatchFileSection, in thread: PatchFileThread) {
+        modelController.loadMoreComments(in: thread, on: section.model)
+    }
+
+    func didSelectQuoteReply(section: PullRequestPatchFileSection, comment: PatchFileThread.Comment, in thread: PatchFileThread) {
+        fetchBody(for: comment.graphQLID) { [weak self] body in
+            guard let self = self else { return }
+
+            let file = section.model
+            let editController = EditPullRequestCommentViewController(
+                client: self.client,
+                action: .pullRequestReviewReply(threadID: thread.graphQLID, pendingReviewId: self.modelController.currentViewModel?.pendingReview?.id),
+                initialText: body.markdownQuoted,
+                codeSettings: self.codeSettings,
+                onCommentCreated: { [weak self] (vc, item) in
+                    vc.dismiss(animated: trueUnlessReduceMotionEnabled)
+                    guard let self = self else { return }
+                    let comment = PatchFileThread.Comment(issueComment: item.comment, state: item.state)
+                    _ = self.modelController.add(comment: comment, to: thread, for: file, pendingReview: item.pendingReview)
+                }, onCancel: { vc in
+                    vc.dismiss(animated: trueUnlessReduceMotionEnabled)
+                }
+            )
+            editController.modalPresentationStyle = .formSheet
+            self.present(editController, animated: trueUnlessReduceMotionEnabled)
+        }
+    }
+
+    func didSelectNewIssue(section: PullRequestPatchFileSection, comment: PatchFileThread.Comment, in thread: PatchFileThread) {
+        fetchBody(for: comment.graphQLID) { [weak self] body in
+            guard let self = self else { return }
+            let reference = makeNewReferenceIssue(body: body, authorLogin: comment.comment.header.login, commentURL: comment.comment.url)
+            try? self.performRoute(NewIssueRoute(
+                repositoryId: nil,
+                title: reference.title,
+                body: reference.body,
+                delegate: self
+            ))
+        }
+    }
+
+    func didSelectReport(section: PullRequestPatchFileSection, comment: PatchFileThread.Comment) {
+        guard let reportRoute = ReportContentRoute(reportable: comment) else { return }
+        try? performRoute(reportRoute)
+    }
+
+    func didSelectFileHeader(isCollapsed: Bool, model: PullRequestFileViewModel) {
+        // passing isCollapsed will inverse current collapse state
+        animatedCollapse(model: model, doCollapse: isCollapsed)
+    }
+
+    func didChangeTaskItem(
+        section: PullRequestPatchFileSection,
+        comment: PatchFileThread.Comment,
+        taskPosition: Int,
+        isChecked: Bool
+    ) {
+        let commentId = comment.graphQLID
+        let action = EditIssueCommentViewController.Action.editPullRequestReviewComment(commentID: commentId)
+        fetchBody(for: commentId) { [weak self] body in
+            self?.client.addComment(
+                with: action,
+                text: body.updatedTaskItem(at: taskPosition, isChecked: isChecked)
+            ) { result in
+                switch result {
+                case .success:
+                    self?.infiniteScroll.adapter.update()
+                case .failure(let error):
+                    self?.toast(error: error)
+                }
+            }
+        }
+    }
+
+    func animatedCollapse(model: PullRequestFileViewModel, doCollapse: Bool) {
+        if doCollapse {
+            collapsedFileIds.insert(model.id)
+        } else {
+            collapsedFileIds.remove(model.id)
+        }
+
+        guard let patchSections = sections as? [PullRequestPatchFileSection]
+            else { return infiniteScroll.adapter.update() }
+
+        let patchSectionIndex = patchSections.firstIndex(where: { $0.model.id == model.id })
+        // NSNotFound is the placeholder value for the section.
+        if let index = patchSectionIndex.flatMap({ IndexPath(row: NSNotFound, section: $0) }) {
+            // Using `.none` here means: If the section top is in range, do not scroll.
+            // If it is not, scroll it to the top of the viewport.
+            tableView.scrollToRow(at: index, at: .none, animated: false)
+        }
+        infiniteScroll.adapter.update()
+    }
+
+    func loadDeletedDiff(model: PullRequestFileViewModel) {
+        modelController.showDeletedDiff(for: model)
+        infiniteScroll.adapter.update()
+    }
+
+    func didSelectIsViewed(isViewed: Bool, model: PullRequestFileViewModel) {
+        animatedCollapse(model: model, doCollapse: isViewed)
+        let rollback = modelController.update(isViewed: isViewed, for: model)
+        let failure = { [weak self] (error: Error) in
+            rollback(error)
+            self?.animatedCollapse(model: model, doCollapse: !isViewed)
+            self?.toast(error: error)
+        }
+
+        Haptic.triggerSelection()
+        if isViewed {
+            toast(type: .informational(
+                title: L10n.labelPullRequestMarkedFileAsViewed)
+            )
+            client.markAsViewed(pullId: model.pullId, path: model.patch.pathChange.path) { result in
+                switch result {
+                case .success:
+                    break
+                case .failure(let error):
+                    failure(error)
+                }
+            }
+        } else {
+            client.unmarkAsViewed(pullId: model.pullId, path: model.patch.pathChange.path) { result in
+                switch result {
+                case .success:
+                    break
+                case .failure(let error):
+                    failure(error)
+                }
+            }
+        }
+    }
+
+    @objc private func toggleEditing(_ gesture: UILongPressGestureRecognizer) {
+        guard gesture.state == .began else { return }
+
+        guard let indexPath = tableView.indexPathForRow(at: gesture.location(in: tableView)),
+            let section = sections[indexPath.section] as? PullRequestPatchFileSection,
+            let viewModel = infiniteScroll.adapter.viewModel(at: indexPath) as? PullRequestDiffLineModel
+            else { return }
+
+        var selection = MultilineCommentSelection(
+            file: section.model,
+            initialSelection: viewModel.patchLine
+        )
+        selection.select(line: viewModel.patchLine)
+        self.lineSelection = selection
+    }
+
+    private func updateBoA() {
+        if let selection = lineSelection {
+            boaViewController.actions = !selection.selectedRange.isEmpty
+                ? [commentAction(for: selection), cancelEditingAction]
+                : [cancelEditingAction]
+        } else {
+            boaViewController.actions = [reviewChangesAction]
+        }
+    }
+
+    // MARK: - PullRequestFilesDataControllerDelegate
+
+    func didUpdate(from oldValue: PullRequestFilesChangedViewModel?, to result: Result<PullRequestFilesChangedViewModel, Error>) {
+        tableView.refreshControl?.endRefreshing { [weak self] in
+            guard let self = self else { return }
+            switch result {
+            case .success(let viewModel):
+                self.reviewViewController.pendingReview = viewModel.pendingReview
+                self.collapsedFileIds.formUnion(viewModel.files.filter { $0.isViewed }.map { $0.id })
+
+                if viewModel.files.isEmpty {
+                    self.setStateEmptyController(
+                        viewModel: EmptyViewModel(
+                            title: L10n.labelPullRequestFilesEmptyTitle,
+                            description: L10n.labelPullRequestFilesEmptyDescription),
+                        in: self.tableView)
+                } else {
+                    self.set(state: .loaded, mainView: self.tableView)
+                }
+            case .failure:
+                self.set(state: .error(delegate: self), mainView: self.tableView)
+            }
+            let wasEmpty = oldValue == nil
+            self.updateShareButton()
+            self.infiniteScroll.adapter.update(animated: !wasEmpty)
+        }
+    }
+
+    // MARK: - NewIssueViewControllerDelegate
+
+    func didCreateNewIssue(model: Issue) {
+        dismiss(animated: trueUnlessReduceMotionEnabled) {
+            try? self.performRoute(IssueRoute(
+                owner: model.owner,
+                repo: model.repo,
+                number: model.number
+            ))
+        }
+    }
+
+    // MARK: - MarkdownCodeCellDelegate
+
+    func codeSettingsDidChange() {
+        infiniteScroll.adapter.update()
+    }
+
+    // MARK: - Keyboard shortcuts
+
+    @objc private func keyboardShortcutReview() {
+        if isBoAEnabled {
+            present(reviewViewController, animated: true)
+        } else {
+            reviewCardController.set(
+                state: DisplayState(type: .visible, displayAsPresentation: true)
+            )
+        }
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+        [
+            UIKeyCommand(
+                title: L10n.labelStartReview,
+                action: #selector(PullRequestFilesViewController.keyboardShortcutReview),
+                input: "r",
+                modifierFlags: []
+            ),
+        ]
+    }
+
+    // MARK: - Unused
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+}
