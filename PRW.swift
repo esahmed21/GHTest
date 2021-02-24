@@ -6,19 +6,6 @@ import UIKit
 
 final class DeploymentCheckRunCell: UITableViewCell, Bindable {
 
-    private static let iconSize = grid(5)
-
-    private let titleLabel = applying(UILabel(), compose(
-        Palette.numberOfLines(0),
-        Palette.textColor(Asset.textPrimary.color),
-        Palette.font(.preferredFont(forTextStyle: .body))
-    ))
-
-    private let trailingTitleLabel = applying(UILabel(), compose(
-        Palette.numberOfLines(0),
-        Palette.textColor(Asset.textTertiary.color),
-        Palette.font(.preferredFont(forTextStyle: .callout))
-    ))
 
     private let leadingIconImageView = applying(UIImageView(), compose(
         Palette.image(Asset.workflow24.image),
@@ -73,6 +60,19 @@ final class DeploymentCheckRunCell: UITableViewCell, Bindable {
         rotateAnimation.isRemovedOnCompletion = false
         return rotateAnimation
     }()
+        private static let iconSize = grid(5)
+
+    private let titleLabel = applying(UILabel(), compose(
+        Palette.numberOfLines(0),
+        Palette.textColor(Asset.textPrimary.color),
+        Palette.font(.preferredFont(forTextStyle: .body))
+    ))
+
+    private let trailingTitleLabel = applying(UILabel(), compose(
+        Palette.numberOfLines(0),
+        Palette.textColor(Asset.textTertiary.color),
+        Palette.font(.preferredFont(forTextStyle: .callout))
+    ))
 
     func bind(viewModel: CheckRunViewModel) {
         titleLabel.text = viewModel.name
