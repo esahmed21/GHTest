@@ -3,8 +3,11 @@ import Lists
 import Palette
 import SnapKit
 import UIKit
+final class DeploymentCheckRunCell: UITableViewCell, Bindable { final class DeploymentCheckRunCell: UITableViewCell, Bindable { final class DeploymentCheckRunCell: UITableViewCell, Bindable {
 
-final class DeploymentCheckRunCell: UITableViewCell, Bindable {
+final class DeploymentCheckRunCell: UITableViewCell, Bindable {final class DeploymentCheckRunCell: UITableViewCell, Bindable {
+
+
 
 
     private let leadingIconImageView = applying(UIImageView(), compose(
